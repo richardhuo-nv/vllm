@@ -669,20 +669,19 @@ class Scheduler(SchedulerInterface):
             req_ids.append(req_id)
             num_tokens = (num_scheduled_tokens[req_id] -
                           len(spec_decode_tokens.get(req_id, ())))
-            if self.use_pp:
+            if self.use_pp or use_connector:
                 # When using PP, the scheduler sends the sampled tokens back,
                 # because there's no direct communication between the first-
                 # stage worker and the last-stage worker. Otherwise, we don't
                 # need to send the sampled tokens back because the model runner
                 # will cache them.
+                # When using a KVConnector, the scheduler sends the sampled
+                # (decoded) tokens to the connector because it may need them
+                # for token lookups and prefix matching to support multi-turn
+                # inference.
                 token_ids = req.all_token_ids[req.num_computed_tokens:req.
                                               num_computed_tokens + num_tokens]
                 new_token_ids.append(token_ids)
-            elif use_connector:
-                # When using a KVConnector, we add a placeholder to avoid index
-                # out of bounds errors. TODO: Remove this once the KVConnector
-                # is updated to handle token IDs properly.
-                new_token_ids.append([])
             new_block_ids.append(
                 req_to_new_blocks[req_id].get_block_ids(allow_none=True))
             num_computed_tokens.append(req.num_computed_tokens)
