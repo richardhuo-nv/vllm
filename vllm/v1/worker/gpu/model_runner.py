@@ -173,6 +173,7 @@ from vllm.v1.worker.utils import (
     clear_layer_kv_caches,
     copy_kv_cache_blocks_inplace,
     get_uniform_decode_token_count,
+    is_uniform_query_len,
 )
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
@@ -635,6 +636,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         additional_attn_cg_support = self.model_state.get_additional_cg_support()
         attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
+        # A transferred full-prompt hit is resumed by recomputing its final
+        # prompt token. With static speculative decoding, the scheduler pads
+        # that one-token short extend with K placeholder draft rows expressly
+        # to preserve the K+1 decode shape. Only promote such batches when the
+        # complete attention stack supports uniform-batch graphs and every
+        # builder that has a decode/prefill split admits K+1 rows. Some builders
+        # (notably DSV4 sparse-SWA and the indexer) intentionally opt out of the
+        # shared reorder vote and expose their real split as decode_threshold;
+        # builders without either threshold (for example the DSV4 compressor)
+        # are governed by their CUDA-graph support declaration.
+        self._spec_short_extends_use_decode_kernels = (
+            attn_cg_support.min_cg_support.value >= 2
+            and all(
+                (
+                    threshold := getattr(
+                        group.get_metadata_builder(),
+                        "decode_threshold",
+                        group.get_metadata_builder().reorder_batch_threshold,
+                    )
+                )
+                is None
+                or threshold >= self.decode_query_len
+                for groups in self.attn_groups
+                for group in groups
+            )
+        )
         # The speculator clears the flag at load time when the checkpoint has
         # no confidence head, so it holds the effective value.
         self.adaptive_verification = maybe_create_adaptive_verification_manager(
@@ -1309,9 +1336,50 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             graph_has_prefill = bool(
                 (is_prefilling_np & (num_computed_prefill_tokens_np == 0)).any()
             )
-        return batch_state, get_uniform_decode_token_count(
+        uniform_tok_count = get_uniform_decode_token_count(
             num_reqs, num_toks, max_query_len, graph_has_prefill
         )
+        if (
+            uniform_tok_count is None
+            and batch_state.has_prefill
+            and self._spec_short_extends_use_decode_kernels
+            and max_query_len == self.decode_query_len
+            and is_uniform_query_len(num_reqs, num_toks, max_query_len)
+        ):
+            # The only prefilling rows eligible here are the scheduler's
+            # one-real-token + K-placeholder transfer-resume rows. Ordinary
+            # prompt chunks, partial speculative batches, and real draft rows
+            # remain excluded.
+            remaining_prefill = (
+                batch_state.prefill_len_np - batch_state.num_computed_prefill_tokens_np
+            )
+            padded_short_extends = True
+            for req_id, is_prefilling, remaining in zip(
+                batch_state.req_ids,
+                batch_state.is_prefilling_np,
+                remaining_prefill,
+            ):
+                if not is_prefilling:
+                    continue
+                draft = draft_tokens.get(req_id)
+                if (
+                    remaining != 1
+                    or draft is None
+                    or len(draft) != self.decode_query_len - 1
+                    or any(token != -1 for token in draft)
+                ):
+                    padded_short_extends = False
+                    break
+            if padded_short_extends:
+                uniform_tok_count = self.decode_query_len
+                logger.warning_once(
+                    "FULLCG_SHORT_EXTEND_PROMOTED width=%d: replaying the "
+                    "captured uniform-decode graph for transferred-prefix "
+                    "one-token short extends",
+                    self.decode_query_len,
+                )
+
+        return batch_state, uniform_tok_count
 
     def _prepare_padding_mask(
         self, num_tokens: int, num_tokens_after_padding: int
@@ -1757,6 +1825,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ),
             uniform_decode=uniform_tok_count == self.decode_query_len,
         )
+        if (
+            batch_req_state is not None
+            and batch_req_state.has_prefill
+            and uniform_tok_count == self.decode_query_len
+        ):
+            logger.warning_once(
+                "FULLCG_SHORT_EXTEND_DISPATCH mode=%s tokens=%d reqs=%d dp_eager=%s",
+                batch_desc.cg_mode,
+                batch_desc.num_tokens,
+                batch_desc.num_reqs,
+                dp_sync.eager if dp_sync is not None else False,
+            )
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
