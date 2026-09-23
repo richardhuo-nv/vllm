@@ -459,6 +459,11 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 ARG vllm_target_device="cuda"
 ENV VLLM_TARGET_DEVICE=${vllm_target_device}
 ENV CCACHE_DIR=/root/.cache/ccache
+ENV GIT_CONFIG_COUNT=2 \
+    GIT_CONFIG_KEY_0=protocol.version \
+    GIT_CONFIG_VALUE_0=1 \
+    GIT_CONFIG_KEY_1=http.version \
+    GIT_CONFIG_VALUE_1=HTTP/1.1
 RUN --mount=type=cache,target=/root/.cache/ccache \
     --mount=type=cache,target=/opt/uv/cache \
     if [ "$USE_SCCACHE" != "1" ]; then \
